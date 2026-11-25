@@ -20,7 +20,8 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seen.json
 
 ANN_URL = ("https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
            "?type=1&catalogId=48&pageNo=1&pageSize=15")
-EXCHANGE_URL = "https://api.binance.com/api/v3/exchangeInfo"
+EXCHANGE_HOSTS = ["data-api.binance.vision", "api.binance.com", "api1.binance.com",
+                  "api2.binance.com", "api3.binance.com", "api4.binance.com"]
 
 
 def get_json(url):
@@ -56,33 +57,56 @@ def save_state(s):
         json.dump(s, f)
 
 
-def fetch_current():
-    articles = get_json(ANN_URL)["data"]["catalogs"][0]["articles"]
-    ann = {str(a["code"]): a["title"] for a in articles}
-    symbols = [s["symbol"] for s in get_json(EXCHANGE_URL)["symbols"]
-               if s.get("status") == "TRADING"]
-    return ann, symbols
+def fetch_announcements():
+    try:
+        articles = get_json(ANN_URL)["data"]["catalogs"][0]["articles"]
+        return {str(a["code"]): a["title"] for a in articles}
+    except Exception as e:
+        print("announcements failed:", e)
+        return None
+
+
+def fetch_symbols():
+    for host in EXCHANGE_HOSTS:
+        try:
+            data = get_json(f"https://{host}/api/v3/exchangeInfo")
+            print("pairs fetched from", host)
+            return [s["symbol"] for s in data["symbols"] if s.get("status") == "TRADING"]
+        except Exception as e:
+            print(f"{host} failed: {e}")
+    return None
 
 
 def check():
-    state = load_state()
-    ann, symbols = fetch_current()
+    state = load_state() or {}
+    ann, symbols = fetch_announcements(), fetch_symbols()
+    if ann is None and symbols is None:
+        print("Both sources failed.")
+        sys.exit(1)
 
-    if state is None:  # first run: remember everything, don't spam
-        save_state({"ann": list(ann), "symbols": symbols})
-        print(f"First run: stored {len(ann)} announcements and {len(symbols)} pairs.")
-        return
+    new_state = dict(state)
+    changed = False
 
-    seen_ann, seen_sym = set(state["ann"]), set(state["symbols"])
-    for code, title in ann.items():
-        if code not in seen_ann:
-            notify("New Binance listing announced", title)
-    new_pairs = [s for s in symbols if s not in seen_sym]
-    if new_pairs:
-        notify("New Binance pairs live", ", ".join(new_pairs[:15]))
+    if ann is not None:
+        old = state.get("ann")
+        if old is not None:  # None means first run for this source: seed silently
+            for code, title in ann.items():
+                if code not in set(old):
+                    notify("New Binance listing announced", title)
+                    changed = True
+        new_state["ann"] = list(set(old or []) | set(ann))
 
-    save_state({"ann": list(seen_ann | set(ann)), "symbols": list(seen_sym | set(symbols))})
-    print(time.strftime("%H:%M"), "checked, nothing new" if not new_pairs else "new pairs found")
+    if symbols is not None:
+        old = state.get("symbols")
+        if old is not None:
+            new_pairs = [x for x in symbols if x not in set(old)]
+            if new_pairs:
+                notify("New Binance pairs live", ", ".join(new_pairs[:15]))
+                changed = True
+        new_state["symbols"] = list(set(old or []) | set(symbols))
+
+    save_state(new_state)
+    print(time.strftime("%H:%M"), "new items found" if changed else "checked, nothing new")
 
 
 if __name__ == "__main__":
